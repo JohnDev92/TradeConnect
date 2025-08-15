@@ -1,0 +1,594 @@
+import yfinance as yf
+import logging
+import time
+import csv
+import os
+from datetime import datetime, timedelta
+import random
+import pandas as pd
+
+# =====================
+# Configuração de logging
+# =====================
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler("bot_daytrade.log"),
+        logging.StreamHandler()
+    ]
+)
+
+# =====================
+# Bot de Day Trade (WIN/WDO) com:
+# - Trailing Stop
+# - Horários dinâmicos por volatilidade
+# - Persistência em CSV
+# - Backtest básico (EMA/RSI/MACD)
+# - Estrutura para broker (placeholder)
+# =====================
+class AutoDayTradingBot:
+    def __init__(self):
+        self.config = {
+            'contratos': 1,
+            'meta_lucro_diario': 500.0,
+            'stop_loss_pontos': 150,
+            'max_trades_dia': 3,
+            'horarios_entrada': ['10:00', '13:00', '15:30'],
+            'contrato_preferido': 'WIN',  # 'WIN' ou 'WDO'
+            'usar_horario_dinamico': True,
+            'trailing_stop_ativo': True,
+            'trailing_stop_pontos': 50,
+            'arquivo_trades': None
+        }
+
+        self.contratos_spec = {
+            'WIN': {
+                'nome': 'Mini Índice Bovespa',
+                'simbolo_yf': '^BVSP',  # Ibovespa
+                'valor_ponto': 0.20,
+                'tick_size': 5,
+                'horario_abertura': '09:00',
+                'horario_fechamento': '17:55',
+                'margem_aprox': 400
+            },
+            'WDO': {
+                'nome': 'Mini Dólar',
+                'simbolo_yf': 'USDBRL=X',
+                'valor_ponto': 0.50,
+                'tick_size': 0.5,
+                'horario_abertura': '09:00',
+                'horario_fechamento': '17:55',
+                'margem_aprox': 1800
+            }
+        }
+
+        self.trades_hoje = []
+        self.lucro_acumulado = 0.0
+        self.posicao_atual = None
+        self.bot_ativo = False
+
+        # Pastas/arquivos
+        if not os.path.exists("historico_trades"):
+            os.makedirs("historico_trades")
+        self.config['arquivo_trades'] = f"historico_trades/trades_{datetime.now().date()}.csv"
+        if not os.path.exists(self.config['arquivo_trades']):
+            with open(self.config['arquivo_trades'], 'w', newline='', encoding='utf-8') as f:
+                writer = csv.DictWriter(f, fieldnames=[
+                    'id','data','contrato','tipo','pontos_entrada','pontos_saida','pontos_take_profit','pontos_stop_loss',
+                    'contratos','valor_por_ponto','resultado','motivo_saida','horario','horario_saida','status'
+                ])
+                writer.writeheader()
+
+    # =====================
+    # Utilidades de dados
+    # =====================
+    def obter_dados_contrato(self, periodo="2d", intervalo="5m") -> pd.DataFrame | None:
+        """Busca candles do Yahoo Finance e converte para 'Pontos'.
+        OBS: dados podem ter atraso; não usar para execução real sem feed RT."""
+        contrato = self.contratos_spec[self.config['contrato_preferido']]
+        simbolo = contrato['simbolo_yf']
+        try:
+            data = yf.Ticker(simbolo).history(period=periodo, interval=intervalo)
+            if data is None or data.empty:
+                logging.warning("Sem dados retornados pelo yfinance")
+                return None
+            if self.config['contrato_preferido'] == 'WIN':
+                data['Pontos'] = data['Close']
+            else:  # WDO
+                data['Pontos'] = data['Close'] * 1000
+            return data
+        except Exception as e:
+            logging.error(f"Erro ao obter dados: {e}")
+            return None
+
+    def calcular_indicadores(self, data: pd.DataFrame) -> pd.DataFrame:
+        """Calcula RSI(9), EMA(9/21), MACD(8,17,6), volatilidade."""
+        df = data.copy()
+        if 'Pontos' not in df.columns:
+            df['Pontos'] = df['Close']
+        delta = df['Pontos'].diff()
+        ganho = (delta.where(delta > 0, 0)).rolling(window=9).mean()
+        perda = (-delta.where(delta < 0, 0)).rolling(window=9).mean()
+        rs = ganho / perda
+        df['RSI'] = 100 - (100 / (1 + rs))
+        df['EMA_9'] = df['Pontos'].ewm(span=9, adjust=False).mean()
+        df['EMA_21'] = df['Pontos'].ewm(span=21, adjust=False).mean()
+        df['MACD'] = df['Pontos'].ewm(span=8, adjust=False).mean() - df['Pontos'].ewm(span=17, adjust=False).mean()
+        df['MACD_signal'] = df['MACD'].ewm(span=6, adjust=False).mean()
+        df['volatilidade_pontos'] = df['Pontos'].rolling(window=10).std()
+        if 'Volume' in df.columns:
+            df['volume_ma'] = df['Volume'].rolling(window=20).mean()
+            df['volume_ratio'] = df['Volume'] / df['volume_ma']
+        else:
+            df['volume_ratio'] = 1.0
+        df.dropna(inplace=True)
+        return df
+
+    # =====================
+    # Persistência
+    # =====================
+    def salvar_trade_csv(self, trade_dict: dict):
+        with open(self.config['arquivo_trades'], 'a', newline='', encoding='utf-8') as f:
+            writer = csv.DictWriter(f, fieldnames=[
+                'id','data','contrato','tipo','pontos_entrada','pontos_saida','pontos_take_profit','pontos_stop_loss',
+                'contratos','valor_por_ponto','resultado','motivo_saida','horario','horario_saida','status'
+            ])
+            writer.writerow(trade_dict)
+
+    # =====================
+    # Avaliação e estratégia
+    # =====================
+    def avaliar_condicoes_entrada(self) -> tuple[bool, int, str, str]:
+        """Retorna (eh_bom, score, motivos, direcao_sugerida)."""
+        data = self.obter_dados_contrato()
+        if data is None or data.empty:
+            return False, 0, "Sem dados", 'NEUTRO'
+        df = self.calcular_indicadores(data)
+        if df.empty:
+            return False, 0, "Sem indicadores", 'NEUTRO'
+        u = df.iloc[-1]
+        score = 0
+        motivos = []
+        direcao = 'COMPRA' if u['EMA_9'] > u['EMA_21'] else 'VENDA'
+
+        # RSI
+        if 30 <= u['RSI'] <= 70:
+            score += 20; motivos.append(f"RSI neutro {u['RSI']:.1f}")
+        elif u['RSI'] < 35:
+            score += 15; motivos.append(f"RSI sobrevenda {u['RSI']:.1f}")
+        elif u['RSI'] > 65:
+            score += 10; motivos.append(f"RSI sobrecompra {u['RSI']:.1f}")
+
+        # Tendência EMA
+        if direcao == 'COMPRA':
+            score += 20; motivos.append("EMA9>EMA21")
+        else:
+            score += 15; motivos.append("EMA9<EMA21")
+
+        # MACD
+        if u['MACD'] > u['MACD_signal']:
+            score += 15; motivos.append("MACD>")
+        else:
+            motivos.append("MACD<")
+
+        # Volatilidade
+        if 20 <= u['volatilidade_pontos'] <= 200:
+            score += 20; motivos.append(f"Vol ok {u['volatilidade_pontos']:.0f}pts")
+
+        # Horário (evitar primeiros 30m e últimos 30m)
+        contrato = self.contratos_spec[self.config['contrato_preferido']]
+        agora = datetime.now().time()
+        abertura_safe = datetime.strptime('09:30', '%H:%M').time()
+        fechamento_safe = datetime.strptime('17:25', '%H:%M').time()
+        if abertura_safe <= agora <= fechamento_safe:
+            score += 25; motivos.append("Horário ok")
+        else:
+            motivos.append("Janela arriscada")
+
+        return score >= 60, score, '; '.join(motivos), direcao
+
+    def calcular_pontos_para_meta(self) -> int:
+        contrato = self.contratos_spec[self.config['contrato_preferido']]
+        valor_por_ponto = contrato['valor_ponto'] * self.config['contratos']
+        pontos_necessarios = (self.config['meta_lucro_diario'] / self.config['max_trades_dia']) / valor_por_ponto
+        return max(1, round(pontos_necessarios))
+
+    # =====================
+    # Execução / Broker (placeholders)
+    # =====================
+    def broker_enviar_ordem(self, tipo: str, quantidade: int):
+        """Placeholder para integração com corretora. Retorna True/False."""
+        logging.info(f"[BROKER] Enviando ordem {tipo} x{quantidade} (SIMULADO)")
+        return True
+
+    def broker_cancelar_ordem(self, trade_id: int):
+        logging.info(f"[BROKER] Cancelar ordem do trade #{trade_id} (SIMULADO)")
+        return True
+
+    # =====================
+    # Entrada / Saída
+    # =====================
+    def executar_entrada(self):
+        data = self.obter_dados_contrato()
+        if data is None or data.empty:
+            logging.warning("Sem dados para entrada")
+            return None
+        df = self.calcular_indicadores(data)
+        u = df.iloc[-1]
+        pontos_atual = u['Pontos']
+        contrato = self.contratos_spec[self.config['contrato_preferido']]
+        pontos_meta = self.calcular_pontos_para_meta()
+
+        direcao = 'COMPRA' if u['EMA_9'] > u['EMA_21'] else 'VENDA'
+        if direcao == 'COMPRA':
+            tp = pontos_atual + pontos_meta
+            sl = pontos_atual - self.config['stop_loss_pontos']
+        else:
+            tp = pontos_atual - pontos_meta
+            sl = pontos_atual + self.config['stop_loss_pontos']
+
+        ok = self.broker_enviar_ordem(direcao, self.config['contratos'])
+        if not ok:
+            logging.error("Falha ao enviar ordem para broker")
+            return None
+
+        trade = {
+            'id': len(self.trades_hoje) + 1,
+            'data': datetime.now().strftime('%Y-%m-%d'),
+            'contrato': self.config['contrato_preferido'],
+            'tipo': direcao,
+            'pontos_entrada': float(pontos_atual),
+            'pontos_saida': None,
+            'pontos_take_profit': float(tp),
+            'pontos_stop_loss': float(sl),
+            'contratos': self.config['contratos'],
+            'valor_por_ponto': contrato['valor_ponto'],
+            'resultado': 0.0,
+            'motivo_saida': '',
+            'horario': datetime.now().strftime('%H:%M:%S'),
+            'horario_saida': '',
+            'status': 'ATIVO'
+        }
+        self.posicao_atual = trade
+        self.trades_hoje.append(trade)
+
+        # Info de risco/retorno
+        lucro_pot = pontos_meta * contrato['valor_ponto'] * self.config['contratos']
+        risco_max = self.config['stop_loss_pontos'] * contrato['valor_ponto'] * self.config['contratos']
+        logging.info(
+            f"ENTRADA #{trade['id']} {trade['contrato']} {direcao} @ {pontos_atual:.1f} | TP {tp:.1f} | SL {sl:.1f} | LUCRO POT R$ {lucro_pot:.2f} | RISCO MÁX R$ {risco_max:.2f}"
+        )
+        return trade
+
+    def atualizar_trailing_stop(self, pontos_atual: float):
+        if not self.posicao_atual or not self.config['trailing_stop_ativo']:
+            return
+        ts = self.config['trailing_stop_pontos']
+        if self.posicao_atual['tipo'] == 'COMPRA':
+            novo_sl = pontos_atual - ts
+            if novo_sl > self.posicao_atual['pontos_stop_loss']:
+                self.posicao_atual['pontos_stop_loss'] = float(novo_sl)
+        else:
+            novo_sl = pontos_atual + ts
+            if novo_sl < self.posicao_atual['pontos_stop_loss']:
+                self.posicao_atual['pontos_stop_loss'] = float(novo_sl)
+
+    def fechar_posicao(self, motivo: str, pontos_saida: float, resultado: float):
+        if not self.posicao_atual:
+            return
+        trade = self.posicao_atual
+        trade['status'] = 'FECHADO'
+        trade['motivo_saida'] = motivo
+        trade['pontos_saida'] = float(pontos_saida)
+        trade['resultado'] = float(resultado)
+        trade['horario_saida'] = datetime.now().strftime('%H:%M:%S')
+        self.lucro_acumulado += resultado
+        self.posicao_atual = None
+
+        # Persistir
+        self.salvar_trade_csv(trade)
+
+        emoji = "💰" if resultado > 0 else "❌"
+        logging.info(
+            f"{emoji} FECHADO #{trade['id']} {trade['contrato']} {trade['tipo']} | {trade['pontos_entrada']:.1f} → {pontos_saida:.1f} | R$ {resultado:+.2f} | Acum: R$ {self.lucro_acumulado:+.2f}"
+        )
+
+        if self.lucro_acumulado >= self.config['meta_lucro_diario']:
+            logging.info(f"META DIÁRIA ATINGIDA! R$ {self.lucro_acumulado:.2f}")
+            self.bot_ativo = False
+
+    def monitorar_posicao(self):
+        if not self.posicao_atual or self.posicao_atual['status'] != 'ATIVO':
+            return
+        data = self.obter_dados_contrato()
+        if data is None or data.empty:
+            return
+        df = self.calcular_indicadores(data)
+        u = df.iloc[-1]
+        pontos_atual = float(u['Pontos'])
+        trade = self.posicao_atual
+
+        # Trailing stop
+        self.atualizar_trailing_stop(pontos_atual)
+
+        # Lógica de saída
+        if trade['tipo'] == 'COMPRA':
+            if pontos_atual >= trade['pontos_take_profit']:
+                pontos_ganhos = pontos_atual - trade['pontos_entrada']
+                lucro = pontos_ganhos * trade['valor_por_ponto'] * trade['contratos']
+                self.fechar_posicao('TAKE_PROFIT', pontos_atual, lucro)
+            elif pontos_atual <= trade['pontos_stop_loss']:
+                pontos_perd = trade['pontos_entrada'] - pontos_atual
+                preju = pontos_perd * trade['valor_por_ponto'] * trade['contratos']
+                self.fechar_posicao('STOP_LOSS', pontos_atual, -preju)
+        else:  # VENDA
+            if pontos_atual <= trade['pontos_take_profit']:
+                pontos_ganhos = trade['pontos_entrada'] - pontos_atual
+                lucro = pontos_ganhos * trade['valor_por_ponto'] * trade['contratos']
+                self.fechar_posicao('TAKE_PROFIT', pontos_atual, lucro)
+            elif pontos_atual >= trade['pontos_stop_loss']:
+                pontos_perd = pontos_atual - trade['pontos_entrada']
+                preju = pontos_perd * trade['valor_por_ponto'] * trade['contratos']
+                self.fechar_posicao('STOP_LOSS', pontos_atual, -preju)
+
+    # =====================
+    # Horários dinâmicos
+    # =====================
+    def definir_horarios_dinamicos(self):
+        if not self.config['usar_horario_dinamico']:
+            return self.config['horarios_entrada']
+        data = self.obter_dados_contrato(periodo="5d", intervalo="5m")
+        if data is None or data.empty:
+            return self.config['horarios_entrada']
+        df = self.calcular_indicadores(data)
+        df['vol'] = df['Pontos'].rolling(window=5).std()
+        # pega as 3 maiores janelas de volatilidade do DIA atual, se houver
+        hoje = df.index.normalize()[-1]
+        df_hoje = df[df.index.normalize() == hoje]
+        if df_hoje.empty:
+            df_hoje = df
+        maiores = df_hoje.sort_values(by='vol', ascending=False).head(3).index
+        return [ts.strftime('%H:%M') for ts in sorted(maiores)]
+
+    # =====================
+    # Backtest simples
+    # =====================
+    def backtest(self, periodo="1mo", intervalo="5m"):
+        logging.info("Iniciando backtest...")
+        data = self.obter_dados_contrato(periodo, intervalo)
+        if data is None or data.empty:
+            logging.error("Sem dados para backtest")
+            return
+        df = self.calcular_indicadores(data)
+        if df.empty:
+            logging.error("Indicadores não disponíveis para backtest")
+            return
+
+        contrato = self.contratos_spec[self.config['contrato_preferido']]
+        valor_ponto = contrato['valor_ponto']
+        contratos = self.config['contratos']
+
+        posicao = None
+        resultados = []
+        for i in range(1, len(df)):
+            row_prev = df.iloc[i-1]
+            row = df.iloc[i]
+
+            # Sinais: cruzamento EMA9/EMA21
+            sinal_compra = row_prev['EMA_9'] <= row_prev['EMA_21'] and row['EMA_9'] > row['EMA_21'] and row['RSI'] > 35
+            sinal_venda  = row_prev['EMA_9'] >= row_prev['EMA_21'] and row['EMA_9'] < row['EMA_21'] and row['RSI'] < 65
+
+            if posicao is None:
+                if sinal_compra or sinal_venda:
+                    tipo = 'COMPRA' if sinal_compra else 'VENDA'
+                    pontos_entrada = row['Pontos']
+                    tp_pts = self.calcular_pontos_para_meta()
+                    if tipo == 'COMPRA':
+                        tp = pontos_entrada + tp_pts
+                        sl = pontos_entrada - self.config['stop_loss_pontos']
+                    else:
+                        tp = pontos_entrada - tp_pts
+                        sl = pontos_entrada + self.config['stop_loss_pontos']
+                    posicao = {
+                        'tipo': tipo,
+                        'entrada': pontos_entrada,
+                        'tp': tp,
+                        'sl': sl
+                    }
+            else:
+                pontos_atual = row['Pontos']
+                # Trailing (simples)
+                if self.config['trailing_stop_ativo']:
+                    ts = self.config['trailing_stop_pontos']
+                    if posicao['tipo'] == 'COMPRA':
+                        posicao['sl'] = max(posicao['sl'], pontos_atual - ts)
+                    else:
+                        posicao['sl'] = min(posicao['sl'], pontos_atual + ts)
+                # Saídas
+                if posicao['tipo'] == 'COMPRA':
+                    if pontos_atual >= posicao['tp'] or pontos_atual <= posicao['sl']:
+                        pontos_mov = pontos_atual - posicao['entrada']
+                        resultado = pontos_mov * valor_ponto * contratos
+                        resultados.append(resultado)
+                        posicao = None
+                else:
+                    if pontos_atual <= posicao['tp'] or pontos_atual >= posicao['sl']:
+                        pontos_mov = posicao['entrada'] - pontos_atual
+                        resultado = pontos_mov * valor_ponto * contratos
+                        resultados.append(resultado)
+                        posicao = None
+
+        if resultados:
+            total = sum(resultados)
+            win = sum(1 for r in resultados if r > 0)
+            loss = sum(1 for r in resultados if r <= 0)
+            media = total / len(resultados)
+            logging.info(f"Backtest: {len(resultados)} trades | Win: {win} | Loss: {loss} | Total R$ {total:.2f} | Média R$ {media:.2f}")
+        else:
+            logging.info("Backtest: sem trades no período.")
+
+    # =====================
+    # Interface de Console
+    # =====================
+    def mostrar_configuracao(self):
+        contrato = self.contratos_spec[self.config['contrato_preferido']]
+        margem_total = contrato['margem_aprox'] * self.config['contratos']
+        print("\n📋 CONFIGURAÇÃO ATUAL:")
+        print(f"• Contrato: {contrato['nome']} ({self.config['contrato_preferido']})")
+        print(f"• Quantidade: {self.config['contratos']} contrato(s)")
+        print(f"• Valor por ponto: R$ {contrato['valor_ponto']:.2f}")
+        print(f"• Meta lucro diário: R$ {self.config['meta_lucro_diario']:.2f}")
+        print(f"• Stop Loss: {self.config['stop_loss_pontos']} pontos")
+        print(f"• Trailing Stop: {self.config['trailing_stop_pontos']} pontos ({'ativo' if self.config['trailing_stop_ativo'] else 'inativo'})")
+        print(f"• Máx trades/dia: {self.config['max_trades_dia']}")
+        print(f"• Horários base: {', '.join(self.config['horarios_entrada'])}")
+        print(f"• Horários dinâmicos: {'sim' if self.config['usar_horario_dinamico'] else 'não'}")
+        print(f"• Margem necessária: R$ {margem_total:,}")
+
+    def calcular_e_mostrar_meta(self):
+        pts = self.calcular_pontos_para_meta()
+        contrato = self.contratos_spec[self.config['contrato_preferido']]
+        lucro_pot = pts * contrato['valor_ponto'] * self.config['contratos']
+        risco_max = self.config['stop_loss_pontos'] * contrato['valor_ponto'] * self.config['contratos']
+        print("\n💡 SIMULAÇÃO POR TRADE:")
+        print(f"• Meta de pontos: {pts}")
+        print(f"• Lucro potencial: R$ {lucro_pot:.2f}")
+        print(f"• Risco máximo: R$ {risco_max:.2f}")
+        rr = lucro_pot/risco_max if risco_max else 0
+        print(f"• Relação risco/retorno: 1:{rr:.1f}")
+
+    def executar_teste_rapido(self):
+        print("\n🧪 EXECUTANDO TESTE RÁPIDO...")
+        data = self.obter_dados_contrato()
+        if data is not None and not data.empty:
+            df = self.calcular_indicadores(data)
+            u = df.iloc[-1]
+            print("✅ Dados ok")
+            print(f"   Pontos atuais: {u['Pontos']:.1f}")
+            ok, score, motivos, direcao = self.avaliar_condicoes_entrada()
+            print(f"   Score de entrada: {score}/100 | {direcao}")
+            print(f"   Motivos: {motivos}")
+            self.calcular_e_mostrar_meta()
+        else:
+            print("⚠️ Erro ao obter dados. Verifique a conexão com a internet")
+
+    # =====================
+    # Loop principal
+    # =====================
+    def executar_trade_automatico(self):
+        if len(self.trades_hoje) >= self.config['max_trades_dia']:
+            print("⏸️ Limite diário de trades atingido")
+            return False
+        if self.lucro_acumulado >= self.config['meta_lucro_diario']:
+            print("🎉 Meta diária já atingida!")
+            return False
+        if self.posicao_atual and self.posicao_atual['status'] == 'ATIVO':
+            print("⏳ Aguardando fechamento da posição atual...")
+            return True
+        ok, score, motivos, _ = self.avaliar_condicoes_entrada()
+        if ok:
+            print(f"✅ Condições favoráveis (Score: {score}/100)")
+            print(f"   Motivos: {motivos}")
+            self.executar_entrada()
+            return True
+        else:
+            print(f"⚠️ Condições não ideais (Score: {score}/100)")
+            print(f"   Motivos: {motivos}")
+            return True
+
+    def loop_principal(self):
+        contrato = self.contratos_spec[self.config['contrato_preferido']]
+        print("\n🚀 BOT AUTOMÁTICO INICIADO!")
+        print(f"Operando: {contrato['nome']} ({self.config['contrato_preferido']})")
+        print("Pressione Ctrl+C para parar")
+
+        self.bot_ativo = True
+        proximas_entradas = self.definir_horarios_dinamicos() if self.config['usar_horario_dinamico'] else self.config['horarios_entrada'].copy()
+
+        try:
+            while self.bot_ativo:
+                agora_hm = datetime.now().strftime('%H:%M')
+
+                # Monitorar posição existente
+                self.monitorar_posicao()
+
+                # Verificar se é hora de fazer entrada
+                if proximas_entradas and agora_hm >= proximas_entradas[0]:
+                    horario_entrada = proximas_entradas.pop(0)
+                    print(f"\n⏰ Horário de entrada: {horario_entrada}")
+                    if self.executar_trade_automatico():
+                        print(f"✅ Entrada processada às {agora_hm}")
+
+                # Encerrar quando acabar agenda e não houver posição
+                if (not proximas_entradas or self.lucro_acumulado >= self.config['meta_lucro_diario']) and not self.posicao_atual:
+                    print("\n✅ Operações do dia finalizadas")
+                    break
+
+                time.sleep(30)
+        except KeyboardInterrupt:
+            print("\n🛑 Bot parado pelo usuário")
+        finally:
+            self.mostrar_resumo_dia()
+
+    def mostrar_resumo_dia(self):
+        print("\n=== RESUMO DO DIA ===")
+        print(f"Contrato operado: {self.config['contrato_preferido']}")
+        print(f"Trades executados: {len(self.trades_hoje)}")
+        print(f"Lucro/Prejuízo total: R$ {self.lucro_acumulado:+.2f}")
+        print(f"Meta diária: R$ {self.config['meta_lucro_diario']:.2f}")
+        if self.lucro_acumulado >= self.config['meta_lucro_diario']:
+            print("🎉 META ATINGIDA!")
+        elif self.lucro_acumulado > 0:
+            print("✅ Dia positivo")
+        else:
+            print("⚠️ Dia negativo")
+        if self.trades_hoje:
+            print("\n📊 DETALHES DOS TRADES:")
+            for t in self.trades_hoje:
+                status_emoji = "💰" if t.get('resultado', 0) > 0 else "❌" if t.get('resultado', 0) < 0 else "⏳"
+                saida = f" → {t['pontos_saida']:.1f}" if t.get('pontos_saida') else ""
+                print(f"{status_emoji} #{t['id']} {t['contrato']} {t['tipo']} - {t['horario']} @ {t['pontos_entrada']:.1f}{saida}")
+                if t['status'] == 'FECHADO':
+                    if t['tipo'] == 'COMPRA':
+                        pontos = t['pontos_saida'] - t['pontos_entrada']
+                    else:
+                        pontos = t['pontos_entrada'] - t['pontos_saida']
+                    print(f"   {t['pontos_entrada']:.1f} → {t['pontos_saida']:.1f} = {pontos:+.1f}pts = R$ {t['resultado']:+.2f}")
+
+
+# =====================
+# Menu de execução
+# =====================
+if __name__ == "__main__":
+    print("=== BOT DAY TRADING WIN/WDO ===")
+    print("🤖 Automação para Mini Índice e Mini Dólar (SIMULAÇÃO)")
+    bot = AutoDayTradingBot()
+
+    while True:
+        print("\n" + "="*50)
+        print("1. ⚙️  Ver Configuração")
+        print("2. 🧪 Teste Rápido")
+        print("3. 🚀 Iniciar Bot Automático")
+        print("4. 📊 Backtest")
+        print("5. ❌ Sair")
+        escolha = input("\nEscolha uma opção (1-5): ")
+        if escolha == '1':
+            bot.mostrar_configuracao()
+            bot.calcular_e_mostrar_meta()
+        elif escolha == '2':
+            bot.executar_teste_rapido()
+        elif escolha == '3':
+            bot.mostrar_configuracao()
+            confirma = input("\n▶️ Iniciar bot automático? (s/N): ").lower()
+            if confirma == 's':
+                bot.loop_principal()
+        elif escolha == '4':
+            periodo = input("Período (ex: 1mo, 3mo, 6mo, 1y) [padrão 1mo]: ") or '1mo'
+            intervalo = input("Intervalo (ex: 1m, 5m, 15m, 30m, 1h) [padrão 5m]: ") or '5m'
+            bot.backtest(periodo=periodo, intervalo=intervalo)
+        elif escolha == '5':
+            print("👋 Até mais!")
+            break
+        else:
+            print("❌ Opção inválida")
